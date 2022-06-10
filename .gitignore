@@ -1,0 +1,8 @@
+# Nix
+result
+
+# Direnv
+.direnv
+
+# Temporary downloads by the script
+nix-darwin-config

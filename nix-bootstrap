@@ -1,0 +1,575 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+_config_dir="${XDG_CONFIG_HOME:-$HOME/.config}"
+
+# Not readonly, as it needs to be unset before Home Manager activation:
+DRY_RUN="${DRY_RUN:-false}"
+
+readonly FORCE_UNINSTALL="${FORCE_UNINSTALL:-false}"
+readonly AUTO_CONFIRM="${AUTO_CONFIRM:-false}"
+readonly USE_NIX_HM="${USE_NIX_HM:-false}"
+readonly NIX_HM_CONFIG_FOLDER="${NIX_HM_CONFIG_FOLDER:-$_config_dir/nix-home-manager-flake-config}"
+
+readonly NIX_HM_FLAKE_CONFIG_REPO="${NIX_HM_FLAKE_CONFIG_REPO:-https://github.com/metacraft-labs/nix-bootstrap}"
+
+readonly bold=$'\E[1m'
+readonly no_bold=$'\E[22m'
+readonly red=$'\E[31m'
+readonly green=$'\E[32m'
+readonly yellow=$'\E[33m'
+readonly blue=$'\E[34m'
+readonly no_color=$'\E[39m'
+
+run_cmd_allowed_to_fail=false
+
+readonly home_nix="$(cat <<'EOF'
+{
+  config,
+  pkgs,
+  ...
+}: {
+  # List of packages to be installed in the user profile:
+  home.packages = [
+  ];
+
+  # Program modules that apply extra configuration to programs,
+  # in addition to installing them in the user profile:
+  programs.bash.enable = true;
+  programs.zsh.enable = true;
+  programs.fish.enable = true;
+  programs.direnv.enable = true;
+  programs.home-manager.enable = true;
+}
+EOF
+)"
+
+readonly flake_nix_template="$(cat <<'EOF'
+{
+  description = "Nix Home configuration";
+
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-22.05-darwin";
+    home-manager.url = "github:nix-community/home-manager/release-22.05";
+    home-manager.inputs.nixpkgs.follows = "nixpkgs";
+  };
+
+  outputs = inputs @ {
+    nixpkgs,
+    home-manager,
+    ...
+  }: let
+    username = "@@USER@@";
+    home = "@@HOME@@";
+    hostname = "@@HOSTNAME@@";
+    system = "@@SYSTEM@@";
+  in {
+    homeConfigurations.${username} = home-manager.lib.homeManagerConfiguration {
+      inherit system username;
+      configuration = import ./home.nix;
+      homeDirectory = home;
+
+      # Update the state version as needed.
+      # See the changelog here:
+      # https://nix-community.github.io/home-manager/release-notes.html#sec-release-22.05
+      stateVersion = "22.05";
+    };
+  };
+}
+EOF
+)"
+
+function main {
+	# To check if Nix is installed, ensure that its profile is sourced (if it
+	# exists).
+	source_nix_profile || true
+
+	task confirm_install_nix "Nix installation" \
+		"Nix successfully installed" \
+		"Nix installation failed" \
+		|| return $?
+
+	source_nix_profile || return $?
+
+	task confirm_enable_nix_command_and_flakes "Nix configuration" \
+		"Nix configuration succeeded" \
+		"Nix configuration failed" \
+		|| return $?
+
+	# task verify_nix_installation "Verifying Nix Flake availability" \
+	# 	"Nix Flakes enabled" \
+	# 	"Nix Flakes not working" \
+	# 	|| return $?
+
+	if [[ "${USE_NIX_HM}" != 'true' ]]; then
+		task install_direnv_imperatively "Install direnv via Nix and hook with user shell" \
+			"direnv configured successfully" \
+			"direnv installation failed" \
+			|| return $?
+	else
+		task generate_flake_nix_from_embedded_template "Generate custom flake.nix configuration" \
+			"flake.nix generated successfully" \
+			"flake.nix generation failed" \
+			|| return $?
+
+		task install_home_manager "Install Home Manager" \
+			"Home Manager installed successfully" \
+			"Home Manager installtion failed" \
+			|| return $?
+	fi
+
+	task bootstrap_repo "Bootstrap repo" \
+		"Repo bootstrapped successfully" \
+		"Repo bootstrap failed" \
+		|| return $?
+}
+
+function is_nix_installed {
+	command -v nix-store &>/dev/null || return $?
+	nix-store --verify &>/dev/null || return $?
+	command -v nix-env &>/dev/null || return $?
+	command -v nix-shell &>/dev/null || return $?
+	command -v nix &>/dev/null || return $?
+}
+
+function is_nix_command_enabled {
+	nix show-config &>/dev/null
+}
+
+function is_nix_flakes_enabled {
+	nix show-config | grep -qE '^experimental-features.*flakes'
+}
+
+function install_nix {
+	run_cmd curl -fsSL https://nixos.org/nix/install -o install_nix.sh || return $?
+	if [[ -t 0 ]]; then
+		run_cmd sh -c "yes | sh ./install_nix.sh; exit \${PIPESTATUS[1]}" || return $?
+	else
+		run_cmd sh ./install_nix.sh || return $?
+	fi
+	run_cmd rm ./install_nix.sh
+}
+
+readonly PROFILE_TARGETS=('/etc/bashrc' '/etc/profile.d/nix.sh' '/etc/zshrc' '/etc/bash.bashrc' '/etc/zsh/zshrc')
+readonly PROFILE_BACKUP_SUFFIX='backup-before-nix'
+readonly PROFILE_BACKUP_SUFFIX_AFTER='backup-after-nix'
+
+function has_previous_nix_installation {
+	for f in /nix/* /etc/nix /var/root/.nix-profile /var/root/.nix-defexpr /var/root/.nix-channels ~/.nix-profile ~/.nix-defexpr ~/.nix-channels; do
+		if [ -e "$f" ]; then
+			echo "Found '$f'"
+			return 0
+		fi
+	done
+	for profile_target in "${PROFILE_TARGETS[@]}"; do
+		if [ -e "${profile_target}.${PROFILE_BACKUP_SUFFIX}" ]; then
+			return 0
+		fi
+	done
+	return 1
+}
+
+function uninstall_nix {
+	for profile_target in "${PROFILE_TARGETS[@]}"; do
+		if [ -e "${profile_target}.${PROFILE_BACKUP_SUFFIX}" ]; then
+			if [ -e  "${profile_target}" ]; then
+			echo "Backing up '${profile_target}'"
+			run_cmd sudo mv "${profile_target}" "${profile_target}.$PROFILE_BACKUP_SUFFIX_AFTER" || return $?
+			fi
+			echo "Restoring previous backup of '${profile_target}'"
+			run_cmd sudo mv "${profile_target}.${PROFILE_BACKUP_SUFFIX}" "${profile_target}" || return $?
+		fi
+	done
+	run_cmd_allowed_to_fail=true
+	run_cmd sudo launchctl unload /Library/LaunchDaemons/org.nixos.nix-daemon.plist
+	run_cmd sudo rm -f /Library/LaunchDaemons/org.nixos.nix-daemon.plist
+	run_cmd sudo launchctl unload /Library/LaunchDaemons/org.nixos.darwin-store.plist
+	run_cmd	sudo rm -f /Library/LaunchDaemons/org.nixos.darwin-store.plist
+	run_cmd sudo dscl . -delete /Groups/nixbld
+	for user in $(dscl . -list /Users | grep _nixbld); do
+		run_cmd sudo dscl . -delete "/Users/$user"
+	done
+	run_cmd sudo rm -rf /etc/nix /var/root/.nix-profile /var/root/.nix-defexpr /var/root/.nix-channels ~/.nix-profile ~/.nix-defexpr ~/.nix-channels
+
+	local mount_output
+	if mount_output="$(mount | grep -E '^/dev/\w+ on /nix')"; then
+		local disk_id
+		if disk_id="$(echo "$mount_output" | grep -oE '^/dev/\w+')"; then
+			run_cmd sudo diskutil unmount force /nix
+			run_cmd sudo diskutil apfs deleteVolume "$disk_id"
+		fi
+	fi
+	run_cmd_allowed_to_fail=false
+}
+
+function confirm_install_nix {
+	if is_nix_installed; then
+		echo "Nix is already installed."
+		if [ "$FORCE_UNINSTALL" != 'true' ]; then
+			return 0
+		else
+			echo "\$FORCE_UNINSTALL is set to true -> removing old Nix installation"
+		fi
+	else
+		cat <<-EOF
+
+		It looks like Nix is not properly installed on your system.
+
+		EOF
+	fi
+
+	if has_previous_nix_installation; then
+		task confirm_uninstall_nix "Remove old Nix installation" 'Older Nix installation removed successfully'  'Failed to remove old Nix installation' || return $?
+	fi
+	confirm "Proceed with new Nix installation? (y/n)" || return $?
+	install_nix
+}
+
+function confirm_uninstall_nix {
+	cat <<-EOF
+
+	But it looks like you have artifacts from an older installation.
+	To proceed with the installation they must be removed.
+
+	EOF
+
+	confirm "Would you like this script to attempt to do that automatically? (y/n)" || return $?
+	uninstall_nix
+}
+
+function confirm_enable_nix_command_and_flakes {
+	if is_nix_command_enabled; then
+		if is_nix_flakes_enabled; then
+			return 0
+		else
+			echo "It looks like the 'flake' experimental feature is not enabled."
+		fi
+	else
+		echo "It looks like the 'nix-command' experimental feature is not enabled."
+	fi
+	confirm "Do you want to enable it? (y/n)" || return $?
+	run_cmd sudo sh -c "echo 'experimental-features = nix-command flakes' >> /etc/nix/nix.conf" || return $?
+}
+
+function source_nix_profile {
+	if [ "$DRY_RUN" = true ] || is_nix_installed; then
+		return 0
+	fi
+	if [ -e '/nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh' ]; then
+		local rc
+		set +eu
+		# shellcheck disable=SC1091
+		. '/nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh'
+		rc=$?
+		set -eu
+		return $rc
+	else
+		return 1
+	fi
+}
+
+function verify_nix_installation {
+	run_cmd sh -c 'nix-shell -p hello --run "hello -g hi" | grep -q hi' || return $?
+	run_cmd sh -c 'nix run nixpkgs#hello -- -g hi | grep -q hi'
+}
+
+function install_direnv_imperatively {
+	bash_rc_file="$HOME/.bashrc"
+	zsh_rc_file="$HOME/.zshrc"
+
+	run_cmd nix-env -iA nixpkgs.direnv || return $?
+
+	for shell in bash zsh; do
+		local shellrc_var="${shell}_rc_file"
+		local shellrc_file="${!shellrc_var}"
+		local hook_cmd="eval \"\$(direnv hook $shell)\""
+		if [ -e "${shellrc_file}" ]; then
+			if grep -q "$hook_cmd" "$shellrc_file"; then
+				echo " ${green}✓${no_color} direnv is already hooked in '${shellrc_file}'"
+				continue;
+			fi
+			echo "Backing up existing '${shellrc_file}' file:"
+			run_cmd cp -nv "${shellrc_file}" "${shellrc_file}.$PROFILE_BACKUP_SUFFIX" || return $?
+		elif [ -L "${shellrc_file}" ] && [[ "$(stat -f %Y "$shellrc_file")" == /nix/store/* ]]; then
+			echo "'${shellrc_file}' is a stale link to the Nix store, removing it"
+			run_cmd unlink "${shellrc_file}" || return $?
+		fi
+		hook_cmd="echo '$hook_cmd'"
+		echo "Updating '$shellrc_file'"
+		run_cmd <<-EOF
+			${hook_cmd} >> "$shellrc_file"
+		EOF
+	done
+}
+
+function generate_flake_nix_from_embedded_template {
+	local repo="${NIX_HM_CONFIG_FOLDER}"
+	echo "Creating a folder to store the Nix Home Manager config"
+	run_cmd mkdir -p "$repo"
+
+	cat <<< "$home_nix" > "$repo/home.nix"
+	cat <<< "$flake_nix_template" > "$repo/flake-template.nix"
+	generate_flake_nix "$repo/flake-template.nix" "$repo/flake.nix"
+}
+
+function generate_flake_nix_from_template_repo {
+	local repo="${NIX_HM_CONFIG_FOLDER}"
+	echo "Cloning Home Manager config repo"
+	run_cmd git clone "$NIX_HM_FLAKE_CONFIG_REPO" "$repo" || return $?
+	generate_flake_nix "$repo/flake-template.nix" "$repo/flake.nix"
+	run_cmd git -C "$repo" add flake.nix
+}
+
+function generate_flake_nix {
+	local src_path="$1"
+	local dest_path="$2"
+
+	local user
+	local home
+	local hostname
+	local system
+
+	system="$(get_system)" ||
+	{ local rc=$?; echo "${red}Failed to get platform info${no_color}"; return $rc; }
+
+	user="$(escape_sed_str "$USER")"
+	home="$(escape_sed_str "$HOME")"
+	hostname="$(escape_sed_str "$(hostname)")"
+	system="$(escape_sed_str "$system")"
+
+	echo "Generating flake.nix"
+	run_cmd <<-EOF
+			cat '$src_path' | sed \
+			-e 's/@@USER@@/$user/' \
+			-e 's/@@HOME@@/$home/' \
+			-e 's/@@HOSTNAME@@/$hostname/' \
+			-e 's/@@SYSTEM@@/$system/' \
+			> '$dest_path'
+		EOF
+}
+
+function escape_sed_str {
+	printf '%s\n' "$1" | sed -e 's/[\/&]/\\&/g'
+}
+
+function install_home_manager {
+	if [ "$DRY_RUN" = true ]; then
+		return 0
+	fi
+
+	echo "Buiding Home Manager config"
+	local flake_uri="$NIX_HM_CONFIG_FOLDER"
+	run_cmd nix build --no-link "${flake_uri}#homeConfigurations.${USER}.activationPackage" || return $?
+
+	echo "Activating Home Manager"
+	export HOME_MANAGER_BACKUP_EXT="${PROFILE_BACKUP_SUFFIX}"
+	run_cmd "$(nix path-info "${flake_uri}#homeConfigurations.${USER}.activationPackage")"/activate || return $?
+
+	echo "Check if home-manager is installed"
+	run_cmd home-manager --version || return $?
+
+	echo "Switch to latest Home Manager config"
+	run_cmd home-manager switch --flake "${flake_uri}#${USER}" || return $?
+}
+
+function bootstrap_repo {
+	echo "Preparing toolchain for local repo"
+	run_cmd nix build ".#devShell.$(get_system)"
+	run_cmd direnv allow .
+}
+
+function get_system {
+	case "$(uname -s).$(uname -m)" in
+	Linux.x86_64)
+		echo "x86_64-linux"
+		;;
+	Linux.i?86)
+		echo "i686-linux"
+		;;
+	Linux.aarch64)
+		echo "aarch64-linux"
+		;;
+	Linux.armv6l_linux)
+		echo "armv6l-linux"
+		;;
+	Linux.armv7l_linux)
+		echo "armv7l-linux"
+		;;
+	Darwin.x86_64)
+		echo "x86_64-darwin"
+		;;
+	Darwin.arm64|Darwin.aarch64)
+		echo "aarch64-darwin"
+		;;
+	*)
+		return 1
+		;;
+	esac
+}
+
+function task {
+	local cmd="$1"
+	local title_msg="$2"
+	local ok_msg="$3"
+	local err_msg="$4"
+
+	start "$title_msg"
+	set +e
+	"$cmd" | wrap_output
+	if [ "${PIPESTATUS[0]}" != "0" ]; then
+		set -e
+		finish "$err_msg" "$red"
+		return 1
+	else
+		set -e
+		if [ "$DRY_RUN" = 'true' ]; then
+			finish "[[DRY RUN] $ok_msg]" "$blue"
+		else
+			finish "[$ok_msg]" "$green"
+		fi
+	fi
+}
+
+depth=0
+function confirm {
+	local default_msg="Are you sure you wish to continue? (y/n)"
+	local msg="${1:-$default_msg}"
+
+	echo -en "╭── ${msg}\n╰─➤ ${bold}"
+	if [ "$AUTO_CONFIRM" = true ]; then
+		echo -e "y${no_bold}"
+	else
+		read -r
+		echo -n "${no_bold}"
+		local i=0
+		while (( i < depth )); do
+			echo -n "│ "
+			(( i+=1 ))
+		done
+	fi
+
+	if [ "$AUTO_CONFIRM" = true ]; then
+		return 0
+	elif [[ ! $REPLY =~ ^[Yy]$ ]]; then
+		return 1
+	fi
+}
+
+function start {
+	local msg="$1"
+	(( depth+=1 ))
+	echo "╭─➤ ${bold}${msg}${no_bold}"
+}
+
+function finish {
+	local msg="$1"
+	local color="$2"
+	(( depth-=1 ))
+	echo "╰── ${color}${msg}${no_color}"
+	echo
+}
+
+function run_cmd {
+	local stdin
+	if [ "$*" = "" ]; then
+		stdin=1
+		local cmd_str
+		cmd_str="$(cat | normalize_whitespace)"
+		start "$cmd"
+	else
+		stdin=0
+		declare -a cmd_arr
+		cmd_arr=( "$@" )
+		start "${cmd_arr[*]}"
+	fi
+	local dry_run="${DRY_RUN:-}"
+	if [[ "$dry_run" != 'true' ]]; then
+		set +e
+		unset DRY_RUN
+		if [ $stdin -eq 1 ]; then
+			eval "$cmd_str" 2>&1
+		else
+			"${cmd_arr[@]}" 2>&1 | wrap_output
+		fi
+		local rc=$?
+		set -e
+		DRY_RUN="$dry_run"
+		if [ $rc -eq 0 ]; then
+			finish "[OK]" "$green"
+		else
+			if [[ "$run_cmd_allowed_to_fail" == 'true' ]]; then
+				finish "[FAILURE SAFE TO IGNORE]" "$yellow"
+			else
+				finish "[ERROR]" "$red"
+				return $rc
+			fi
+		fi
+	else
+		finish "[DRY RUN]" "$blue"
+	fi
+}
+
+function normalize_whitespace {
+	sed -e 's/^[[:space:]]\{1,\}//' -e 's/[[:space:]]\{1,\}/ /g'
+}
+
+function wrap_output {
+	perl -e "$(cat <<-'EOF'
+		use strict;
+		use Fcntl;
+		fcntl(STDIN, F_SETFL, fcntl(STDIN, F_GETFL, 0) | O_NONBLOCK);
+
+		my $rin = '';
+		vec($rin, fileno(STDIN), 1) = 1;
+		my $rout;
+
+		my $lastCharIsNewLine = '';
+		my $needsNewline = '';
+		my $firstLine = '';
+		while (1) {
+			select($rout=$rin, undef, undef, undef);
+			last if eof();
+			if (!$firstLine) {
+				print "│ ";
+				$firstLine = 1;
+			}
+			my $buffer = '';
+			while (1) {
+				my $c = getc();
+				last if not defined $c;
+				$buffer .= $c;
+			}
+
+			my @lines = split(/(?<=\n)/, $buffer);
+
+			my $i = 0;
+			for (@lines) {
+				if ($_ =~ /^(\x1b\[([0-9]{1,2}(;[0-9]{1,2})*)?[m|K])/) {
+					print "$1";
+					$_ = substr($_, length($1));
+				}
+				if ($needsNewline) {
+					print "│ ";
+				}
+				print "$_";
+				select()->flush();
+				$i++;
+				$needsNewline = '';
+				if (substr($_, -1) eq "\n") {
+					$needsNewline = 1;
+				}
+			}
+			if ($i > 0) {
+				my $last_line = $lines[-1];
+				$lastCharIsNewLine = substr($last_line, -1) eq "\n";
+			}
+		}
+		if (! $lastCharIsNewLine && $firstLine) {
+			print "\n";
+		}
+		EOF
+)"
+}
+
+main

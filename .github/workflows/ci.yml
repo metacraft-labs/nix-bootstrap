@@ -1,0 +1,21 @@
+
+name: CI
+on: [push, pull_request, workflow_dispatch]
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [macOS-latest]
+        dry_run: [true, false]
+        force_uninstall: [true, false]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v1
+
+      - name: Run the install script
+        run: ./nix-bootstrap
+        env:
+          AUTO_CONFIRM: true
+          DRY_RUN: ${{ matrix.dry_run }}
+          FORCE_UNINSTALL: ${{ matrix.force_uninstall }}
