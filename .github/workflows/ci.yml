@@ -9,6 +9,7 @@ jobs:
         os: [macOS-latest]
         dry_run: [true, false]
         force_uninstall: [true, false]
+        use_nix_hm: [true, false]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v1
@@ -19,3 +20,4 @@ jobs:
           AUTO_CONFIRM: true
           DRY_RUN: ${{ matrix.dry_run }}
           FORCE_UNINSTALL: ${{ matrix.force_uninstall }}
+          USE_NIX_HM: ${{ matrix.use_nix_hm }}
